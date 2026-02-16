@@ -507,12 +507,23 @@ function jumpToChapter(chIdx){
   const c = ch[Math.max(0, Math.min(ch.length-1, Number(chIdx)||0))];
   const idx = Math.max(0, Number(c.startIndex||0));
 
-  // Save current position and stop playback BEFORE jumping
-  try{ stopReading({save:true}); }catch(e){}
-
+  // If we're inside an active reading screen, stop playback WITHOUT saving first,
+  // then set cursor to the chapter start and save once (prevents stale-save races).
   if(state.route?.name === 'reader' || state.route?.name === 'bireader'){
+    try{ stopReading({save:false}); }catch(e){}
+
     // Jump inside active reading screen
     setCursorIndex(idx, {syncUI:true, scroll:true});
+
+  // NEW: Cross-mode sync so mode-switch won't restore an older index
+  if(state.route?.name === 'reader'){
+    try{ state.reading.activeBiLineIndex = idx; }catch(e){}
+    try{ state.reading.resumeIndexBi = idx; }catch(e){}
+  }else{
+    try{ state.reading.activeParaIndex = idx; }catch(e){}
+    try{ state.reading.resumeIndexReader = idx; }catch(e){}
+  }
+
     try{ saveReadingProgress(); }catch(e){}
     try{ closeChapters(); }catch(e){}
     return;
@@ -568,7 +579,15 @@ function switchMode(nextRoute){
     if(!Number.isFinite(startIndex) || startIndex < 0) startIndex = 0;
   }catch(e){ startIndex = 0; }
 
-  try{ saveReadingProgress(); }catch(e){}
+    try{ saveReadingProgress(); }catch(e){}
+
+  // NEW: prevent snap-back by forcing both modes' active indices to the same cursor
+  try{ syncCursorIndex(startIndex); }catch(e){}
+  try{ state.reading.activeParaIndex = startIndex; }catch(e){}
+  try{ state.reading.activeBiLineIndex = startIndex; }catch(e){}
+  try{ state.reading.resumeIndexReader = startIndex; }catch(e){}
+  try{ state.reading.resumeIndexBi = startIndex; }catch(e){}
+
   // Pass startIndex as a safety-net: even if storage restore fails, Read/Listen won't jump to the beginning.
   go({name: nextRoute, bookId, startIndex}, {push:false});
 }
@@ -1873,7 +1892,7 @@ function renderBiReader(){
   hideTranslation();
 
   const lines = (b.text || []);
-  state.reading.biTotal = effectiveTotalLines(lines);
+  state.reading.biTotal = lines.length;
 
   const chapterStarts = new Set((getChapters()||[]).map(c=>Number(c.startIndex||0)).filter(n=>Number.isFinite(n)));
 
@@ -2082,11 +2101,18 @@ function syncCursorIndex(idx){
   try{
     let i = Number(idx);
     if(!Number.isFinite(i) || i < 0) i = 0;
+
     state.reading.cursorIndex = i;
     openaiLineIndex = i;
+
     // keep both resume indices aligned so mode switching is stable
     state.reading.resumeIndexReader = i;
     state.reading.resumeIndexBi = i;
+
+    // NEW: keep the other mode's active index in sync to prevent snap-back
+    if(!Number.isFinite(state.reading.activeBiLineIndex) || state.reading.activeBiLineIndex < 0){
+      state.reading.activeBiLineIndex = i;
+    }
   }catch(e){}
 }
 
@@ -2176,8 +2202,6 @@ let __hlRaf = 0;
 function stopAudioWordHighlight(){
   if(__hlRaf) cancelAnimationFrame(__hlRaf);
   __hlRaf = 0;
-  // IMPORTANT: avoid stuck last word/line highlight after audio ends/pauses
-  try{ clearAllWordHighlights(); }catch(e){}
 }
 function startAudioWordHighlight({ audio, paraIdx, text, mode, spans }){
   stopAudioWordHighlight();
@@ -3512,7 +3536,7 @@ btnStart.onclick = ()=>{
       clearActiveLineUI();
     }
 
-    const total = Number(effectiveTotalLines(state.book?.text)||0);
+    const total = Number(state.reading.biTotal||state.book?.text?.length||0);
     state.reading.progress = total>0 ? 1/total : 0;
     updateProgressUI();
     saveReadingProgress();
