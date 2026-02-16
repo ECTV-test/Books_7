@@ -507,58 +507,51 @@ function jumpToChapter(chIdx){
   const c = ch[Math.max(0, Math.min(ch.length-1, Number(chIdx)||0))];
   const idx = Math.max(0, Number(c.startIndex||0));
 
-  try{ stopReading(); }catch(e){}
+  // If we're inside an active reading screen, stop playback WITHOUT saving first,
+  // then set cursor to the chapter start and save once (prevents stale-save races).
+  if(state.route?.name === 'reader' || state.route?.name === 'bireader'){
+    try{ stopReading({save:false}); }catch(e){}
 
+    // Jump inside active reading screen
+    setCursorIndex(idx, {syncUI:true, scroll:true});
+
+  // NEW: Cross-mode sync so mode-switch won't restore an older index
   if(state.route?.name === 'reader'){
-    openaiLineIndex = idx;
-    state.reading.activeParaIndex = idx;
-    state.reading.resumeIndexReader = idx;
-    try{ clearActivePara(); }catch(e){}
-    try{ setActivePara(idx); }catch(e){}
-    setTimeout(()=>{ try{ scrollToPara(idx); }catch(e){} }, 50);
-    updateProgressUI();
-    saveReadingProgress();
-  }else if(state.route?.name === 'bireader'){
-    state.reading.activeBiLineIndex = idx;
-    state.reading.resumeIndexBi = idx;
-    openaiLineIndex = idx;
-    try{ clearActiveLineUI(); }catch(e){}
-    try{ setActiveLineUI(idx); }catch(e){}
-    setTimeout(()=>{ try{ scrollToLine(idx); }catch(e){} }, 50);
-    updateProgressUI();
-    saveReadingProgress();
+    try{ state.reading.activeBiLineIndex = idx; }catch(e){}
+    try{ state.reading.resumeIndexBi = idx; }catch(e){}
+  }else{
+    try{ state.reading.activeParaIndex = idx; }catch(e){}
+    try{ state.reading.resumeIndexReader = idx; }catch(e){}
   }
 
-  else {
-    // Details screen: save selected chapter as the next start position for this (book + language pair)
+    try{ saveReadingProgress(); }catch(e){}
+    try{ closeChapters(); }catch(e){}
+    return;
+  }
+
+  // Details screen: save selected chapter as the next start position for this (book + language pair)
+  try{
+    const bookId = resolveBookId();
+    const src = String(state.reading.sourceLang || state.book?.sourceLang || "en").trim().toLowerCase();
+    const trg = String(state.reading.targetLang || "uk").trim().toLowerCase();
+    const pkgKey = pkgProgressKey(bookId, src, trg);
+
+    // Keep previous percent if exists
+    let prevProgress = 0;
     try{
-      const bookId = resolveBookId();
-      const src = String(state.reading.sourceLang || state.book?.sourceLang || "en").trim().toLowerCase();
-      const trg = String(state.reading.targetLang || "uk").trim().toLowerCase();
-      const pkgKey = pkgProgressKey(bookId, src, trg);
+      const prev = getPkgProgress(bookId, src, trg);
+      if(prev && typeof prev.progress === "number") prevProgress = Number(prev.progress||0);
+    }catch(_e){}
 
-      // Keep previous percent if exists
-      let prevProgress = 0;
-      try{
-        const prev = getPkgProgress(bookId, src, trg);
-        if(prev && typeof prev.progress === "number") prevProgress = Number(prev.progress||0);
-      }catch(_e){}
+    const pkgPayload = { sourceLang: src, targetLang: trg, progress: prevProgress, activeIndex: idx, ts: Date.now() };
+    try{ localStorage.setItem(pkgKey, JSON.stringify(pkgPayload)); }
+    catch(e){ try{ sessionStorage.setItem(pkgKey, JSON.stringify(pkgPayload)); }catch(_e){} }
 
-      const pkgPayload = {
-        sourceLang: src,
-        targetLang: trg,
-        progress: prevProgress,
-        activeIndex: idx,
-        ts: Date.now()
-      };
-      try{ localStorage.setItem(pkgKey, JSON.stringify(pkgPayload)); }catch(e){
-        try{ sessionStorage.setItem(pkgKey, JSON.stringify(pkgPayload)); }catch(_e){}
-      }
-      saveLastPkg(bookId, state.route?.name||"details", src, trg);
-    }catch(e){}
-  }
-
+    saveLastPkg(bookId, state.route?.name||"details", src, trg);
+  }catch(e){}
+  try{ closeChapters(); }catch(e){}
 }
+
 
 /* ---------------------------
    Mode switch (inside reader modes)
@@ -586,7 +579,15 @@ function switchMode(nextRoute){
     if(!Number.isFinite(startIndex) || startIndex < 0) startIndex = 0;
   }catch(e){ startIndex = 0; }
 
-  try{ saveReadingProgress(); }catch(e){}
+    try{ saveReadingProgress(); }catch(e){}
+
+  // NEW: prevent snap-back by forcing both modes' active indices to the same cursor
+  try{ syncCursorIndex(startIndex); }catch(e){}
+  try{ state.reading.activeParaIndex = startIndex; }catch(e){}
+  try{ state.reading.activeBiLineIndex = startIndex; }catch(e){}
+  try{ state.reading.resumeIndexReader = startIndex; }catch(e){}
+  try{ state.reading.resumeIndexBi = startIndex; }catch(e){}
+
   // Pass startIndex as a safety-net: even if storage restore fails, Read/Listen won't jump to the beginning.
   go({name: nextRoute, bookId, startIndex}, {push:false});
 }
@@ -634,6 +635,19 @@ function resolveBookId(){
   const id = state.route?.bookId || state.route?.id || state.book?.id || state.book?.bookId;
   if(!id) return null;
   return String(id);
+}
+
+
+function effectiveTotalLines(lines){
+  try{
+    if(!Array.isArray(lines)) return Number(lines?.length||0);
+    for(let i=lines.length-1;i>=0;i--){
+      if(String(lines[i]||"").trim()) return i+1;
+    }
+    return lines.length;
+  }catch(e){
+    return Number(lines?.length||0);
+  }
 }
 
 function progressKey(bookId, mode){
@@ -812,12 +826,12 @@ function saveReadingProgress(){
     // store progress percent for catalog/library cards
     try{
       if(mode === "reader"){
-        const total = Number(state.book?.text?.length || state.reading.totalParas || 0);
+        const total = Number(effectiveTotalLines(state.book?.text) || state.reading.totalParas || 0);
         const idx = Number.isFinite(payload.activeParaIndex) ? payload.activeParaIndex : 0;
         payload.total = total;
         payload.progress = total>0 ? Math.max(0, Math.min(100, ((idx+1)/total)*100)) : 0;
       }else{
-        const total = Number(state.reading.biTotal || state.book?.text?.length || 0);
+        const total = Number(state.reading.biTotal || effectiveTotalLines(state.book?.text) || 0);
         const idx = Number.isFinite(payload.activeBiLineIndex) ? payload.activeBiLineIndex : 0;
         payload.total = total;
         payload.progress = total>0 ? Math.max(0, Math.min(100, ((idx+1)/total)*100)) : 0;
@@ -835,15 +849,16 @@ function saveReadingProgress(){
       // capture cursor index for this mode so we can restore per (source→target)
       let activeIndex = 0;
       try{
+        const ci = Number.isFinite(state.reading.cursorIndex) ? Number(state.reading.cursorIndex) : null;
         const oi = Number.isFinite(openaiLineIndex) ? Number(openaiLineIndex) : null;
         if(mode === "reader"){
           const a = Number(state.reading.activeParaIndex);
           const r = Number(state.reading.resumeIndexReader);
-          activeIndex = Number.isFinite(a) ? a : (Number.isFinite(r) ? r : (oi ?? 0));
+          activeIndex = Number.isFinite(a) ? a : (Number.isFinite(r) ? r : (ci ?? oi ?? 0));
         }else if(mode === "bireader"){
           const a = Number(state.reading.activeBiLineIndex);
           const r = Number(state.reading.resumeIndexBi);
-          activeIndex = Number.isFinite(a) ? a : (Number.isFinite(r) ? r : (oi ?? 0));
+          activeIndex = Number.isFinite(a) ? a : (Number.isFinite(r) ? r : (ci ?? oi ?? 0));
         }else{
           activeIndex = oi ?? 0;
         }
@@ -891,9 +906,10 @@ function restoreReadingProgress(){
         state.reading.resumeIndexBi = idx;
       }catch(e){}
       openaiLineIndex = idx;
+      try{ state.reading.cursorIndex = idx; }catch(e){}
 
       // progress for current view
-      const total = Number(state.book?.text?.length||0);
+      const total = Number(effectiveTotalLines(state.book?.text)||0);
       state.reading.progress = total>0 ? (idx+1)/total : 0;
 
       return idx;
@@ -911,7 +927,7 @@ function restoreReadingProgress(){
           state.reading.activeParaIndex = Number.isFinite(idx) ? idx : 0;
           state.reading.resumeIndexReader = state.reading.activeParaIndex;
           openaiLineIndex = state.reading.activeParaIndex;
-          const total = Number(state.book?.text?.length||0);
+          const total = Number(effectiveTotalLines(state.book?.text)||0);
           state.reading.progress = total>0 ? (state.reading.activeParaIndex+1)/total : 0;
           return state.reading.activeParaIndex;
         }else{
@@ -919,7 +935,7 @@ function restoreReadingProgress(){
           state.reading.activeBiLineIndex = Number.isFinite(idx) ? idx : 0;
           state.reading.resumeIndexBi = state.reading.activeBiLineIndex;
           openaiLineIndex = state.reading.activeBiLineIndex;
-          const total = Number(state.book?.text?.length||0);
+          const total = Number(effectiveTotalLines(state.book?.text)||0);
           state.reading.progress = total>0 ? (state.reading.activeBiLineIndex+1)/total : 0;
           return state.reading.activeBiLineIndex;
         }
@@ -943,31 +959,58 @@ function restoreReadingProgress(){
   }
 }
 
+function restoreProgressForPair(bookId, src, trg){
+  try{
+    if(!bookId) return 0;
+    src = String(src || "en").trim().toLowerCase();
+    trg = String(trg || "uk").trim().toLowerCase();
+
+    const pkg = getPkgProgress(bookId, src, trg);
+    const idx = (pkg && typeof pkg.activeIndex === "number") ? Math.max(0, Number(pkg.activeIndex||0)) : 0;
+
+    // sync indices across modes
+    try{ state.reading.activeParaIndex = idx; state.reading.resumeIndexReader = idx; }catch(e){}
+    try{ state.reading.activeBiLineIndex = idx; state.reading.resumeIndexBi = idx; }catch(e){}
+    try{ openaiLineIndex = idx; }catch(e){}
+    try{ state.reading.cursorIndex = idx; }catch(e){}
+
+    // compute progress using effective total lines (ignore trailing blanks)
+    const total = Number(effectiveTotalLines(state.book?.text)||0);
+    state.reading.progress = total>0 ? (idx+1)/total : 0;
+
+    return idx;
+  }catch(e){
+    return 0;
+  }
+}
+
+
 
 
 function applyLanguagePairChange(){
-  try{ saveReadingProgress(); }catch(e){}
-  try{ stopReading(); }catch(e){}
-  // reset cursor so new pairs never inherit the old line index
-  try{ openaiLineIndex = 0; }catch(e){}
-  try{ state.reading.activeParaIndex = 0; state.reading.resumeIndexReader = 0; }catch(e){}
-  try{ state.reading.activeBiLineIndex = 0; state.reading.resumeIndexBi = 0; }catch(e){}
-  const idx = (()=>{
-    try{ return restoreReadingProgress() || 0; }catch(e){ return 0; }
-  })();
-
   try{
-    if(state.route?.name === "reader"){
-      try{ clearActivePara(); }catch(e){}
-      try{ setActivePara(idx); }catch(e){}
-      setTimeout(()=>{ try{ scrollToPara(idx); }catch(e){} }, 60);
-    }else if(state.route?.name === "bireader"){
-      try{ clearActiveLine(); }catch(e){}
-      try{ setActiveLine(idx); }catch(e){}
-      setTimeout(()=>{ try{ scrollToLine(idx); }catch(e){} }, 60);
+    const bookId = resolveBookId();
+    if(!bookId) return;
+
+    const src = String(state.reading.sourceLang || state.book?.sourceLang || "en").trim().toLowerCase();
+    const trg = String(state.reading.targetLang || "uk").trim().toLowerCase();
+
+    // If user changes the pair while audio is playing in an active reader, stop & save current progress first.
+    // (In Details we already saved before changing the pair, so this is just a safe guard.)
+    if(state.route?.name === "reader" || state.route?.name === "bireader"){
+      try{ stopReading({ save:true }); }catch(e){}
     }
+
+    // Restore progress for the NEW pair (bookId + src + trg) without zeroing anything.
+    const idx = restoreProgressForPair(bookId, src, trg);
+
+    // If we are inside a reader screen, update UI highlight/scroll immediately.
+    try{
+      if(state.route?.name === "reader" || state.route?.name === "bireader"){
+        setCursorIndex(idx, {syncUI:true, scroll:true});
+      }
+    }catch(e){}
   }catch(e){}
-  try{ updateProgressUI(); }catch(e){}
 }
 /* ---------------------------
    Bookmarks (per book)
@@ -1034,6 +1077,7 @@ function go(route, {push=true}={}){
     state.reading.resumeIndexReader = 0;
     state.reading.activeBiLineIndex = 0;
     state.reading.resumeIndexBi = 0;
+    state.reading.cursorIndex = 0;
     state.reading.activeTokenIndex = -1;
     state.reading.tokenMap = [];
     try{ state.reading.translateCache?.clear?.(); }catch(e){}
@@ -1045,24 +1089,19 @@ function go(route, {push=true}={}){
 
   if(route.name === "catalog"){
     state.book = null;
-    stopReading();
+    stopReading({save:true});
     renderCatalog();
     hidePlayer();
   }
   
   if(route.name === "library"){
     state.book = null;
-    stopReading();
+    stopReading({save:true});
     renderLibrary();
     hidePlayer();
   }
 if(route.name === "details"){
-    stopReading();
-    openaiLineIndex = 0;
-    state.reading.activeParaIndex = 0;
-    state.reading.resumeIndexReader = 0;
-    state.reading.activeBiLineIndex = 0;
-    state.reading.resumeIndexBi = 0;
+    stopReading({save:true});
     loadBook(route.bookId, state.reading.sourceLang).then(book=>{
       state.book = book;
       renderDetails();
@@ -1070,12 +1109,7 @@ if(route.name === "details"){
     });
   }
   if(route.name === "reader"){
-    stopReading();
-    openaiLineIndex = 0;
-    state.reading.activeParaIndex = 0;
-    state.reading.resumeIndexReader = 0;
-    state.reading.activeBiLineIndex = 0;
-    state.reading.resumeIndexBi = 0;
+    stopReading({save:true});
     loadBook(route.bookId, state.reading.sourceLang).then(book=>{
       state.book = book;
       renderReader();
@@ -1086,19 +1120,12 @@ if(route.name === "details"){
       if((!Number.isFinite(idx) || idx===0) && Number.isFinite(__fallbackStart) && __fallbackStart>0){ idx = __fallbackStart; }
 
       try{ clearAllWordHighlights(); }catch(e){}
-      try{ clearActivePara(); }catch(e){}
-      try{ setActivePara(idx); }catch(e){ try{ state.reading.activeParaIndex = idx; state.reading.resumeIndexReader = idx; }catch(_e){} }
-      setTimeout(()=>{ try{ scrollToPara(idx); }catch(e){} }, 60);
+      setCursorIndex(idx, {syncUI:true, scroll:true});
     });
   }
 
   if(route.name === "bireader"){
-    stopReading();
-    openaiLineIndex = 0;
-    state.reading.activeParaIndex = 0;
-    state.reading.resumeIndexReader = 0;
-    state.reading.activeBiLineIndex = 0;
-    state.reading.resumeIndexBi = 0;
+    stopReading({save:true});
     loadBook(route.bookId, state.reading.sourceLang).then(book=>{
       state.book = book;
       renderBiReader();
@@ -1109,9 +1136,7 @@ if(route.name === "details"){
       if((!Number.isFinite(idx) || idx===0) && Number.isFinite(__fallbackStart) && __fallbackStart>0){ idx = __fallbackStart; }
 
       try{ clearAllWordHighlights(); }catch(e){}
-      try{ clearActiveLineUI(); }catch(e){}
-      try{ setActiveLineUI(idx); }catch(e){ try{ state.reading.activeBiLineIndex = idx; state.reading.resumeIndexBi = idx; }catch(_e){} }
-      setTimeout(()=>{ try{ scrollToLine(idx); }catch(e){} }, 60);
+      setCursorIndex(idx, {syncUI:true, scroll:true});
     });
   }
 }
@@ -1342,7 +1367,25 @@ function renderCatalog(){
   document.getElementById("tabLibrary").onclick = ()=>go({name:"library"}, {push:false});
 
   if(cont){
-    const openCont = ()=>go({name:"details", bookId: cont.id});
+    const openCont = ()=>{
+      try{
+        const last = getGlobalLastInteraction();
+        const bid = cont.id;
+        if(last && String(last.bookId||"")===String(bid||"")){
+          state.reading.sourceLang = last.sourceLang || state.reading.sourceLang;
+          state.reading.targetLang = last.targetLang || state.reading.targetLang;
+          const pkg = getPkgProgress(bid, state.reading.sourceLang, state.reading.targetLang);
+          const idx = pkg && typeof pkg.activeIndex==="number" ? Number(pkg.activeIndex||0) : 0;
+          if(String(last.mode||"")==="read"){
+            go({name:"bireader", bookId: bid, startIndex: idx});
+          }else{
+            go({name:"reader", bookId: bid, startIndex: idx});
+          }
+          return;
+        }
+      }catch(e){}
+      go({name:"details", bookId: cont.id});
+    };
     const cc = document.getElementById("continueCard");
     cc.onclick = openCont;
     cc.onkeydown = (e)=>{ if(e.key==="Enter"||e.key===" "){ e.preventDefault(); openCont(); } };
@@ -1680,6 +1723,7 @@ function setLabels(){
 setLabels();
 
   src.onchange = ()=>{
+    try{ stopReading({save:true}); }catch(e){}
     try{ saveReadingProgress(); }catch(e){}
     state.reading.sourceLang = src.value;
     try{ state.reading.translateCache.clear(); }catch(e){}
@@ -1688,6 +1732,7 @@ setLabels();
   };
 
   trg.onchange = ()=>{
+    try{ stopReading({save:true}); }catch(e){}
     try{ saveReadingProgress(); }catch(e){}
     state.reading.targetLang = trg.value;
     try{ state.reading.translateCache.clear(); }catch(e){}
@@ -1695,8 +1740,8 @@ setLabels();
     applyLanguagePairChange();
   };
 
-  document.getElementById("btnListen").onclick = ()=>go({name:"reader", bookId: b.id},{push:false});
-  document.getElementById("btnRead").onclick = ()=>go({name:"bireader", bookId: b.id},{push:false});
+  document.getElementById("btnListen").onclick = ()=>{ try{ stopReading({save:true}); }catch(e){} state.reading.mode="listen"; state.reading.sourceLang = src.value; state.reading.targetLang = trg.value; try{ restoreProgressForPair(b.id, src.value, trg.value); }catch(e){} go({name:"reader", bookId: b.id},{push:false}); };
+  document.getElementById("btnRead").onclick = ()=>{ try{ stopReading({save:true}); }catch(e){} state.reading.mode="read"; state.reading.sourceLang = src.value; state.reading.targetLang = trg.value; try{ restoreProgressForPair(b.id, src.value, trg.value); }catch(e){} go({name:"bireader", bookId: b.id},{push:false}); };
 }
 
 function renderReader(){
@@ -1847,7 +1892,7 @@ function renderBiReader(){
   hideTranslation();
 
   const lines = (b.text || []);
-  state.reading.biTotal = lines.length;
+  state.reading.biTotal = effectiveTotalLines(lines);
 
   const chapterStarts = new Set((getChapters()||[]).map(c=>Number(c.startIndex||0)).filter(n=>Number.isFinite(n)));
 
@@ -2040,19 +2085,40 @@ function buildParaWordMap(){
 function clearActivePara(){
   const prev = state.reading.activeParaIndex;
   try{
+    // defensive: clear any stuck paragraph highlights
+    document.querySelectorAll('.para.activeLine').forEach(el=>el.classList.remove('activeLine'));
+  }catch(e){}
+  try{
     if(prev != null && prev >= 0){
-      // remove paragraph highlight
-      if(state.reading.paras && state.reading.paras[prev]){
-        state.reading.paras[prev].classList.remove("activeLine");
-      }
-      // remove any lingering word highlight
       clearParaWordHighlight(prev);
     }
   }catch(e){}
   state.reading.activeParaIndex = -1;
 }
 
+
+function syncCursorIndex(idx){
+  try{
+    let i = Number(idx);
+    if(!Number.isFinite(i) || i < 0) i = 0;
+
+    state.reading.cursorIndex = i;
+    openaiLineIndex = i;
+
+    // keep both resume indices aligned so mode switching is stable
+    state.reading.resumeIndexReader = i;
+    state.reading.resumeIndexBi = i;
+
+    // NEW: keep the other mode's active index in sync to prevent snap-back
+    if(!Number.isFinite(state.reading.activeBiLineIndex) || state.reading.activeBiLineIndex < 0){
+      state.reading.activeBiLineIndex = i;
+    }
+  }catch(e){}
+}
+
 function setActivePara(idx){
+  // Always keep engine cursor in sync with UI cursor
+  syncCursorIndex(idx);
   // IMPORTANT: always update cursor index, even if highlight is OFF
   if(idx === state.reading.activeParaIndex) { state.reading.activeParaIndex = idx; return; }
 
@@ -2133,20 +2199,13 @@ function setActiveParaWord(paraIdx, wordIdx){
 
 // Universal word highlight for AUDIO playback (OpenAI / any mp3). Works on iOS too.
 let __hlRaf = 0;
-function stopAudioWordHighlight(opts={}){
+function stopAudioWordHighlight(){
   if(__hlRaf) cancelAnimationFrame(__hlRaf);
   __hlRaf = 0;
-
-  // Always clear word highlights to avoid "stuck last word"
+  // NEW: avoid stuck last word/line highlight after audio ends/pauses
   try{ clearAllWordHighlights(); }catch(e){}
-
-  // Optional: clear line highlights too (use ONLY on full stop/finish, not on pause)
-  try{
-    if(opts && opts.clearLine){
-      try{ clearActivePara(); }catch(e){}
-      try{ clearActiveLineUI(); }catch(e){}
-    }
-  }catch(e){}
+  try{ clearActivePara(); }catch(e){}
+  try{ clearActiveLineUI(); }catch(e){}
 }
 function startAudioWordHighlight({ audio, paraIdx, text, mode, spans }){
   stopAudioWordHighlight();
@@ -2599,10 +2658,7 @@ async function showTranslation(span){
   popPlayFromHere.onclick = ()=>{
     const pEl = span.closest(".para[data-para]");
     const pIdx = pEl ? Number(pEl.dataset.para) : 0;
-    openaiLineIndex = Math.max(0, pIdx);
-    state.reading.activeParaIndex = openaiLineIndex;
-    clearActivePara();
-    setActivePara(openaiLineIndex);
+    setCursorIndex(pIdx, {syncUI:true, scroll:true});
     startReadingOpenAI({mode:"reader", speakTranslation:false});
     hideTranslation();
   };
@@ -2687,10 +2743,7 @@ async function showLineCard(paraIdx){
   popSpeak.onclick = ()=>playOneShotTTS(raw);
 
   popPlayFromHere.onclick = ()=>{
-    openaiLineIndex = Math.max(0, paraIdx);
-    state.reading.activeParaIndex = openaiLineIndex;
-    clearActivePara();
-    setActivePara(openaiLineIndex);
+    setCursorIndex(paraIdx, {syncUI:true, scroll:true});
     startReadingOpenAI({mode:"reader", speakTranslation:false});
     hideTranslation();
   };
@@ -2733,8 +2786,9 @@ let activeTransEl = null;
 
 function clearActiveLineUI(){
   try{
-    if(activeLineEl) activeLineEl.classList.remove("activeLine");
-    if(activeTransEl) activeTransEl.classList.remove("activeTrans");
+    // defensive: clear any stuck highlights
+    document.querySelectorAll('.activeLine').forEach(el=>el.classList.remove('activeLine'));
+    document.querySelectorAll('.activeTrans').forEach(el=>el.classList.remove('activeTrans'));
   }catch(e){}
   activeLineEl = null;
   activeTransEl = null;
@@ -2742,6 +2796,8 @@ function clearActiveLineUI(){
 
 function setActiveLineUI(idx){
   // Works only in Bi-reader (line-by-line mode)
+  // Always keep engine cursor in sync with UI cursor
+  syncCursorIndex(idx);
   // IMPORTANT: always update cursor index, even if highlight is OFF
   state.reading.activeBiLineIndex = idx;
   state.reading.resumeIndexBi = idx;
@@ -2826,6 +2882,45 @@ let openaiSessionId = 0;
 let openaiLineIndex = 0;
 let openaiStopRequested = false;
 
+// Single source of truth for reading position.
+// Keep UI cursor + OpenAI line cursor always in sync to avoid "highlight at X but play from Y".
+function setCursorIndex(idx, {syncUI=true, scroll=true}={}){
+  let i = Number(idx);
+  if(!Number.isFinite(i) || i < 0) i = 0;
+  // clamp to effective total if available
+  try{
+    const totalEff = Number(effectiveTotalLines(state.book?.text) || 0);
+    if(totalEff > 0) i = Math.min(i, totalEff - 1);
+  }catch(e){}
+  state.reading.cursorIndex = i;
+  openaiLineIndex = i;
+
+  // Update per-mode indices so mode switch & restore won't drift
+  try{
+    state.reading.resumeIndexReader = i;
+    state.reading.resumeIndexBi = i;
+  }catch(e){}
+
+  if(!syncUI) return i;
+
+  try{
+    if(state.route?.name === "reader"){
+      state.reading.activeParaIndex = i;
+      try{ clearActivePara(); }catch(e){}
+      try{ setActivePara(i); }catch(e){}
+      if(scroll) setTimeout(()=>{ try{ scrollToPara(i); }catch(e){} }, 30);
+    }else if(state.route?.name === "bireader"){
+      state.reading.activeBiLineIndex = i;
+      try{ clearActiveLineUI(); }catch(e){}
+      try{ setActiveLineUI(i); }catch(e){}
+      if(scroll) setTimeout(()=>{ try{ scrollToLine(i); }catch(e){} }, 30);
+    }
+  }catch(e){}
+  try{ updateProgressUI(); }catch(e){}
+  return i;
+}
+
+
 function getListenLines(){
   return (state.book?.text || []).map(s=>String(s ?? ""));
 }
@@ -2860,7 +2955,11 @@ async function fetchTtsAudioBlob(text, {voice, instructions, speed, noCache=fals
 
 
 async function startReadingOpenAI(){
-  stopReading();
+  // Ensure engine starts from current cursor (prevents "jump back to first save")
+  try{ if(Number.isFinite(state.reading.cursorIndex)) openaiLineIndex = state.reading.cursorIndex; }catch(e){}
+  try{ clearActiveWord(); }catch(e){}
+
+  stopReading({save:false});
   ensureAudioUnlocked();
   state.reading.isPlaying = true;
   btnPlay.textContent = "⏸";
@@ -2868,13 +2967,21 @@ async function startReadingOpenAI(){
 
   openaiStopRequested = false;
   const thisSession = (++openaiSessionId);
-  // resume index depends on mode
+  // resume index depends on mode (cursorIndex is the single source of truth)
   const mode = state.route?.name;
-  if(mode === "bireader"){
-    openaiLineIndex = Number.isFinite(state.reading.resumeIndexBi) ? state.reading.resumeIndexBi : (Number.isFinite(state.reading.activeBiLineIndex)? state.reading.activeBiLineIndex : 0);
-  }else{
-    openaiLineIndex = Number.isFinite(state.reading.resumeIndexReader) ? state.reading.resumeIndexReader : (Number.isFinite(state.reading.activeParaIndex)? state.reading.activeParaIndex : 0);
+  let startIdx = Number.isFinite(state.reading.cursorIndex) ? Number(state.reading.cursorIndex) : null;
+  if(startIdx == null){
+    if(mode === "bireader"){
+      const a = Number(state.reading.activeBiLineIndex);
+      const r = Number(state.reading.resumeIndexBi);
+      startIdx = Number.isFinite(a) ? a : (Number.isFinite(r) ? r : 0);
+    }else{
+      const a = Number(state.reading.activeParaIndex);
+      const r = Number(state.reading.resumeIndexReader);
+      startIdx = Number.isFinite(a) ? a : (Number.isFinite(r) ? r : 0);
+    }
   }
+  setCursorIndex(startIdx, {syncUI:true, scroll:false});
   // mode already computed above
   const lines = getListenLines();
 
@@ -2942,15 +3049,14 @@ const playNext = async ()=>{
     // - Listen mode (reader): word highlight only (no full paragraph block)
     // - Read mode (bireader): line highlight (two rows)
     if(mode === "reader"){
-      setActivePara(openaiLineIndex);
-      scrollToPara(openaiLineIndex);
+      setCursorIndex(openaiLineIndex, {syncUI:true, scroll:true});
     }else{
-      setActiveLineUI(openaiLineIndex);
+      setCursorIndex(openaiLineIndex, {syncUI:true, scroll:false});
     }
 
-    // Progress is line-based for OpenAI narration
+    // Progress is line-based for OpenAI narration (ignore trailing empty lines)
     try{
-      const total = lines.length || 0;
+      const total = Number(effectiveTotalLines(lines) || lines.length || 0);
       if(total > 0){
         state.reading.progress = (openaiLineIndex + 1) / total;
         updateProgressUI();
@@ -3093,45 +3199,67 @@ function resumeReading(){
   startReadingOpenAI();
 }
 
-function stopReading(){
+function stopReading(opts={save:true}){
+  const save = opts && opts.save !== false;
+
+  // derive the most reliable cursor from UI indices
+  let cursor = 0;
   try{
-    // remember last position per mode
-    try{
-      const mode = state.route?.name;
-      if(mode === 'bireader'){
-        if(Number.isFinite(openaiLineIndex)) state.reading.resumeIndexBi = openaiLineIndex;
-      }else if(mode === 'reader'){
-        if(Number.isFinite(openaiLineIndex)) state.reading.resumeIndexReader = openaiLineIndex;
-      }
-    }catch(e){}
-saveReadingProgress();
-	try{ clearActivePara(); }catch(e){}
-	try{ if(state.reading._browserCancel) state.reading._browserCancel(); }catch(e){}
+    if(state.route?.name === "reader"){
+      const a = Number(state.reading.activeParaIndex);
+      const r = Number(state.reading.resumeIndexReader);
+      cursor = Number.isFinite(a) ? a : (Number.isFinite(r) ? r : (Number.isFinite(openaiLineIndex)? openaiLineIndex:0));
+      state.reading.resumeIndexReader = cursor;
+    }else if(state.route?.name === "bireader"){
+      const a = Number(state.reading.activeBiLineIndex);
+      const r = Number(state.reading.resumeIndexBi);
+      cursor = Number.isFinite(a) ? a : (Number.isFinite(r) ? r : (Number.isFinite(openaiLineIndex)? openaiLineIndex:0));
+      state.reading.resumeIndexBi = cursor;
+    }else{
+      cursor = Number.isFinite(openaiLineIndex) ? openaiLineIndex : 0;
+    }
+    if(!Number.isFinite(cursor) || cursor < 0) cursor = 0;
+    openaiLineIndex = cursor;
+    state.reading.cursorIndex = cursor;
+  }catch(e){ cursor = 0; }
+
+  // keep shared cursor in sync across modes
+  try{ state.reading.cursorIndex = cursor; }catch(e){}
+  try{ state.reading.resumeIndexReader = cursor; }catch(e){}
+  try{ state.reading.resumeIndexBi = cursor; }catch(e){}
+
+  // Save progress BEFORE any UI cleanup
+  try{ if(save) saveReadingProgress(); }catch(e){}
+
+  // Cancel any ongoing browser TTS / timers / observers
+  try{ if(state.reading._browserCancel) state.reading._browserCancel(); }catch(e){}
   state.reading._browserCancel = null;
-  clearActiveLineUI();
+
+  try{ clearActiveLineUI(); }catch(e){}
   try{ if(lineObserver) lineObserver.disconnect(); }catch(e){}
   try{ if(biProgressObserver) biProgressObserver.disconnect(); }catch(e){}
   lineObserver = null;
   biProgressObserver = null;
 
   state.reading.isPlaying = false;
-  btnPlay.textContent = "▶";
+  try{ btnPlay.textContent = "▶"; }catch(e){}
 
   if(state.reading.timer) clearInterval(state.reading.timer);
   state.reading.timer = null;
 
-  clearActiveWord();
-  state.reading.progress = 0;
-  updateProgressUI();
+  try{ clearActiveWord(); }catch(e){}
 
-  if("speechSynthesis" in window) window.speechSynthesis.cancel();
+  // IMPORTANT: do NOT zero progress here (it breaks history/library)
+  try{ updateProgressUI(); }catch(e){}
 
-  stopAudioWordHighlight();
+  if("speechSynthesis" in window){
+    try{ window.speechSynthesis.cancel(); }catch(e){}
+  }
 
-  openaiStopRequested = true;
-  try{ if(openaiAudio){ openaiAudio.pause(); openaiAudio.src = ""; } }catch(e){}
-  openaiAudio = null;
-	}catch(e){}
+  // stop OpenAI loop
+  try{
+    openaiStopRequested = true;
+  }catch(e){}
 }
 
 function finishReading(){
@@ -3145,23 +3273,26 @@ function finishReading(){
   if(state.reading.timer) clearInterval(state.reading.timer);
   state.reading.timer = null;
 
+// Force cursor to the real last non-empty line and persist 100% progress
+try{
+  const totalEff = Number(effectiveTotalLines(state.book?.text)||0);
+  const lastIdx = totalEff>0 ? (totalEff-1) : 0;
+  openaiLineIndex = lastIdx;
+  if(state.route?.name === "reader"){
+    state.reading.activeParaIndex = lastIdx;
+    state.reading.resumeIndexReader = lastIdx;
+  }else if(state.route?.name === "bireader"){
+    state.reading.activeBiLineIndex = lastIdx;
+    state.reading.resumeIndexBi = lastIdx;
+  }
+}catch(e){}
+try{ saveReadingProgress(); }catch(e){}
+try{ clearActiveWord(); }catch(e){}
+
   state.reading.progress = 1;
   updateProgressUI();
 
   if("speechSynthesis" in window) window.speechSynthesis.cancel();
-
-  // Ensure cursor/progress are saved as 100% for this language pair
-  try{
-    const total = effectiveTotalLines(getListenLines());
-    const last = Math.max(0, total-1);
-    openaiLineIndex = last;
-    const mode = state.route?.name;
-    if(mode === 'bireader') state.reading.resumeIndexBi = last; else state.reading.resumeIndexReader = last;
-    saveReadingProgress();
-  }catch(e){}
-
-  // Clear highlights at the very end to avoid stuck last word/line
-  stopAudioWordHighlight({clearLine:true});
 
   openaiStopRequested = true;
   try{ if(openaiAudio){ openaiAudio.pause(); openaiAudio.src = ""; } }catch(e){}
@@ -3391,7 +3522,7 @@ btnStart.onclick = ()=>{
     state.reading.activeParaIndex = 0;
     setActivePara(0);
 
-    const total = Number(state.book?.text?.length||0);
+    const total = Number(effectiveTotalLines(state.book?.text)||0);
     state.reading.progress = total>0 ? 1/total : 0;
     updateProgressUI();
     saveReadingProgress();
@@ -3409,7 +3540,7 @@ btnStart.onclick = ()=>{
       clearActiveLineUI();
     }
 
-    const total = Number(state.reading.biTotal||state.book?.text?.length||0);
+    const total = Number(state.reading.biTotal || effectiveTotalLines(state.book?.text) || 0);
     state.reading.progress = total>0 ? 1/total : 0;
     updateProgressUI();
     saveReadingProgress();
