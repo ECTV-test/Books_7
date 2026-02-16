@@ -3105,8 +3105,8 @@ function stopReading(){
       }
     }catch(e){}
 saveReadingProgress();
-    try{ clearActivePara(); }catch(e){}
-    if(state.reading._browserCancel state.reading._browserCancel(); }catch(e){}
+	try{ clearActivePara(); }catch(e){}
+	try{ if(state.reading._browserCancel) state.reading._browserCancel(); }catch(e){}
   state.reading._browserCancel = null;
   clearActiveLineUI();
   try{ if(lineObserver) lineObserver.disconnect(); }catch(e){}
@@ -3131,6 +3131,7 @@ saveReadingProgress();
   openaiStopRequested = true;
   try{ if(openaiAudio){ openaiAudio.pause(); openaiAudio.src = ""; } }catch(e){}
   openaiAudio = null;
+	}catch(e){}
 }
 
 function finishReading(){
