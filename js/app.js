@@ -514,6 +514,16 @@ function jumpToChapter(chIdx){
 
     // Jump inside active reading screen
     setCursorIndex(idx, {syncUI:true, scroll:true});
+
+  // NEW: Cross-mode sync so mode-switch won't restore an older index
+  if(state.route?.name === 'reader'){
+    try{ state.reading.activeBiLineIndex = idx; }catch(e){}
+    try{ state.reading.resumeIndexBi = idx; }catch(e){}
+  }else{
+    try{ state.reading.activeParaIndex = idx; }catch(e){}
+    try{ state.reading.resumeIndexReader = idx; }catch(e){}
+  }
+
     try{ saveReadingProgress(); }catch(e){}
     try{ closeChapters(); }catch(e){}
     return;
@@ -569,7 +579,15 @@ function switchMode(nextRoute){
     if(!Number.isFinite(startIndex) || startIndex < 0) startIndex = 0;
   }catch(e){ startIndex = 0; }
 
-  try{ saveReadingProgress(); }catch(e){}
+    try{ saveReadingProgress(); }catch(e){}
+
+  // NEW: prevent snap-back by forcing both modes' active indices to the same cursor
+  try{ syncCursorIndex(startIndex); }catch(e){}
+  try{ state.reading.activeParaIndex = startIndex; }catch(e){}
+  try{ state.reading.activeBiLineIndex = startIndex; }catch(e){}
+  try{ state.reading.resumeIndexReader = startIndex; }catch(e){}
+  try{ state.reading.resumeIndexBi = startIndex; }catch(e){}
+
   // Pass startIndex as a safety-net: even if storage restore fails, Read/Listen won't jump to the beginning.
   go({name: nextRoute, bookId, startIndex}, {push:false});
 }
@@ -2083,11 +2101,18 @@ function syncCursorIndex(idx){
   try{
     let i = Number(idx);
     if(!Number.isFinite(i) || i < 0) i = 0;
+
     state.reading.cursorIndex = i;
     openaiLineIndex = i;
+
     // keep both resume indices aligned so mode switching is stable
     state.reading.resumeIndexReader = i;
     state.reading.resumeIndexBi = i;
+
+    // NEW: keep the other mode's active index in sync to prevent snap-back
+    if(!Number.isFinite(state.reading.activeBiLineIndex) || state.reading.activeBiLineIndex < 0){
+      state.reading.activeBiLineIndex = i;
+    }
   }catch(e){}
 }
 
