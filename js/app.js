@@ -40,6 +40,18 @@ const FLAG_BY_LANG = {
   es: "🇪🇸",
   fr: "🇫🇷"
 };
+function normalizeLangCode(code){
+  const c = String(code||"").trim().toLowerCase();
+  if(!c) return "auto";
+  // accept "uk-UA" etc
+  const base = c.split(/[-_]/)[0];
+  if(base === "ua") return "uk";
+  return base;
+}
+function normalizeTextForTranslate(s){
+  return String(s||"").replace(/\u00A0/g," ").replace(/\s+/g," ").trim();
+}
+
 function flagFor(code){
   return FLAG_BY_LANG[code] || "🏳️";
 }
@@ -2350,64 +2362,100 @@ async function translateWord(word){
 }
 
 async function translateTextAny(text){
-  const s = String(text || "").trim();
-  if(!s) return "";
+  const s = normalizeTextForTranslate(text||"");
+  if(!s) return "—";
 
-  const cacheKey = `LINE|${state.dev.translationProvider}|${state.reading.targetLang}|${s}`;
-  if(state.reading.translateCache.has(cacheKey)) return state.reading.translateCache.get(cacheKey);
-
-  const now = Date.now();
-  if(now < (state.reading.cooldownUntil || 0)){
-    const sec = Math.max(1, Math.ceil((state.reading.cooldownUntil - now)/1000));
-    return `⏳ Ліміт перекладу. Спробуй через ${sec}s.`;
+  // Cooldown after 429
+  if(state.reading.cooldownUntil && Date.now() < state.reading.cooldownUntil){
+    return "⏳ Ліміт. Зачекай 20 секунд.";
   }
-  if(state.reading.inFlight) return "…";
-  if(now - (state.reading.lastReqAt || 0) < 900) return "…";
 
-  state.reading.inFlight = true;
-  state.reading.lastReqAt = now;
+  // Cache (per provider + source/target + text)
+  const provider = String(state.dev.translationProvider || "openai").toLowerCase(); // openai | libre
+  const sl = normalizeLangCode(state.reading.sourceLang || state.book?.sourceLang || "auto");
+  const tl = normalizeLangCode(state.reading.targetLang || "uk");
+  const cacheKey = `${provider}::${sl}::${tl}::${s}`;
+  const cached = state.reading.translateCache.get(cacheKey);
+  if(cached) return cached;
 
-  try{
-    if(state.dev.translationProvider === "openai"){
-      const url = String(WORKER_TRANSLATE_URL || "").trim();
-      if(!url) return "— (Worker URL не задано)";
+  // Prefer Worker if configured (keys stay in Worker secrets)
+  const workerUrl = String(WORKER_TRANSLATE_URL || "").trim();
 
-      const res = await fetch(url, {
-        method:"POST",
-        headers: {"Content-Type":"application/json"},
-        body: JSON.stringify({text: s, target: state.reading.targetLang || "uk", noCache: !!state.dev.noCache})
-      });
+  // Helper: call worker translate
+  async function callWorkerTranslate(){
+    if(!workerUrl) return null;
+    const res = await fetch(workerUrl, {
+      method:"POST",
+      headers: {"Content-Type":"application/json"},
+      body: JSON.stringify({
+        text: s,
+        sourceLang: sl || "auto",
+        targetLang: tl,
+        provider,
+        noCache: !!state.dev.noCache
+      })
+    }).catch(()=>null);
 
-      if(res.status === 429){
-        state.reading.cooldownUntil = Date.now() + 20000;
-        return "⏳ Ліміт. Зачекай 20 секунд.";
-      }
-      if(!res.ok) return `— (помилка ${res.status})`;
-
-      const data = await res.json().catch(()=> ({}));
-      const translated = (data.translatedText || "").trim() || "—";
-      state.reading.translateCache.set(cacheKey, translated);
-      return translated;
-    }
-
-    const payload = {q: s, source: "auto", target: state.reading.targetLang || "uk", format: "text", api_key: LIBRETRANSLATE_API_KEY || ""};
-    const res = await fetch(LIBRETRANSLATE_URL, {method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify(payload)});
-
+    if(!res) return null;
     if(res.status === 429){
       state.reading.cooldownUntil = Date.now() + 20000;
-      return "⏳ Ліміт перекладу. Зачекай 20 секунд.";
+      return "⏳ Ліміт. Зачекай 20 секунд.";
+    }
+    if(!res.ok){
+      // Surface status but don't break UI
+      return `— (помилка ${res.status})`;
+    }
+    const data = await res.json().catch(()=> ({}));
+    const translated = String(data.translation || data.translatedText || "").trim() || "—";
+    return translated;
+  }
+
+  // Helper: call public LibreTranslate directly (optional key)
+  async function callLibreDirect(){
+    const url = String(LIBRETRANSLATE_URL || "").trim();
+    if(!url) return null;
+
+    // Libre expects source/target codes; "auto" is usually accepted for source.
+    const payload = {
+      q: s,
+      source: sl || "auto",
+      target: tl,
+      format: "text"
+    };
+    if(LIBRETRANSLATE_API_KEY) payload.api_key = String(LIBRETRANSLATE_API_KEY);
+
+    const res = await fetch(url, {
+      method:"POST",
+      headers: {"Content-Type":"application/json"},
+      body: JSON.stringify(payload)
+    }).catch(()=>null);
+
+    if(!res) return null;
+    if(res.status === 429){
+      state.reading.cooldownUntil = Date.now() + 20000;
+      return "⏳ Ліміт. Зачекай 20 секунд.";
     }
     if(!res.ok) return `— (помилка ${res.status})`;
 
     const data = await res.json().catch(()=> ({}));
-    const translated = data.translatedText || "—";
-    state.reading.translateCache.set(cacheKey, translated);
+    const translated = String(data.translatedText || data.translation || "").trim() || "—";
     return translated;
-  }catch(e){
-    return "— (не вдалося підключитися)";
-  }finally{
-    state.reading.inFlight = false;
   }
+
+  let translated = null;
+
+  if(provider === "libre"){
+    // Try Worker first (if your Libre key is stored there), then fall back to direct
+    translated = await callWorkerTranslate();
+    if(translated == null) translated = await callLibreDirect();
+  }else{
+    // OpenAI provider must go through Worker
+    translated = await callWorkerTranslate();
+  }
+
+  translated = (translated == null ? "—" : translated);
+  state.reading.translateCache.set(cacheKey, translated);
+  return translated;
 }
 
 
