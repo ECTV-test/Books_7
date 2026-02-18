@@ -1031,7 +1031,7 @@ function saveBookmarks(bookId, arr){
     try{ sessionStorage.setItem(bmKey(bookId), JSON.stringify(arr||[])); }catch(_e){}
   }
 }
-function addBookmarkEntry({bookId, paraIdx, raw, tr, sourceLang, targetLang, mode}){
+function addBookmarkEntry({bookId, paraIdx, raw, tr}){
   if(!bookId) return;
   const r = String(raw||"").trim();
   const t = String(tr||"").trim();
@@ -1042,10 +1042,7 @@ function addBookmarkEntry({bookId, paraIdx, raw, tr, sourceLang, targetLang, mod
     paraIdx: Number.isFinite(paraIdx) ? Number(paraIdx) : 0,
     raw: r,
     tr: t,
-    sourceLang: String(sourceLang||"").toLowerCase(),
-    targetLang: String(targetLang||"").toLowerCase(),
-    mode: String(mode||"").toLowerCase(),
-        createdAt: Date.now()
+    createdAt: Date.now()
   };
   // Requirement: new bookmark from the same book goes UNDER existing ones (append)
   list.push(entry);
@@ -1582,26 +1579,7 @@ function renderLibrary(){
         const list = loadBookmarks(bookId);
         const it = list.find(x=>x && x.id===entryId);
         const idx = Number(it?.paraIdx||0);
-
-        // Restore language pair from the bookmark (fallback to last used pair for this book)
-        try{
-          const last = getLastPkg(bookId) || {};
-          const s = (it?.sourceLang || last.sourceLang || state.reading.sourceLang || "en");
-          const t = (it?.targetLang || last.targetLang || state.reading.targetLang || "uk");
-          state.reading.sourceLang = String(s).toLowerCase();
-          state.reading.targetLang = String(t).toLowerCase();
-        }catch(e){}
-
-        // Open in the same mode as the bookmark if available (fallback: last used mode for this book)
-        let routeName = "reader";
-        try{
-          const last = getLastPkg(bookId) || {};
-          const m = String(it?.mode || last.mode || "listen").toLowerCase();
-          routeName = (m === "read") ? "bireader" : "reader";
-        }catch(e){}
-
-        // Navigate to the book at the bookmark position
-        go({name: routeName, bookId, startPara: idx}, {push:true});
+        go({name:"reader", bookId, startPara: idx});
       });
     });
     app.querySelectorAll("[data-bm-del]").forEach(btn=>{
